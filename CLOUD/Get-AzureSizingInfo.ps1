@@ -1,5 +1,5 @@
 #requires -Version 7.0
-#requires -Modules Az.Accounts, Az.Compute, Az.Storage, Az.Sql, Az.SqlVirtualMachine, Az.ResourceGraph, Az.Monitor, Az.Resources, Az.RecoveryServices, Az.CostManagement, Az.CosmosDB
+#requires -Modules Az.Accounts, Az.Aks, Az.Compute, Az.Storage, Az.Sql, Az.SqlVirtualMachine, Az.ResourceGraph, Az.Monitor, Az.Resources, Az.RecoveryServices, Az.CostManagement, Az.CosmosDB
 
 <#
 .SYNOPSIS
@@ -36,7 +36,7 @@ To prepare to run this script from a local system do the following:
   
   2. Install the Azure Powershell modules that are required by this script by running the command:
 
-      "Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,Az.ResourceGraph,Az.Monitor,Az.Resources,Az.RecoveryServices,Az.CostManagement,Az.CosmosDB"
+      "Install-Module Az.Accounts,Az.Aks,Az.Compute,Az.Storage,Az.Sql,Az.SqlVirtualMachine,Az.ResourceGraph,Az.Monitor,Az.Resources,Az.RecoveryServices,Az.CostManagement,Az.CosmosDB"
   
   3. Verify that the Azure AD account that will be used to run this script has the "Reader" and "Reader and Data Access"
       roles on each subscription to be scanned. 
@@ -77,8 +77,11 @@ may take a long time when large blob stores are located.
 A comma separated list of Azure Management Groups to gather data from.
 
 .PARAMETER GetKeyVaultAmounts
-Gets number of key vaults, and amount of certificates, keys, and secrets in each key vault. One must add the 
+Gets number of key vaults, and amount of certificates, keys, and secrets in each key vault. One must add the
 permission 'Key Vault Reader' to each subscription in order to use the flag
+
+.PARAMETER SkipAKS
+Do not collect data on Azure Kubernetes Service (AKS) clusters, including cluster configuration, node pools, and resource utilization.
 
 .PARAMETER SkipAzureBackup
 Do not collect data on Azure Backup Vaults, Policies, Items, and cost.
@@ -138,7 +141,12 @@ Updated by DamaniN: 11/3/23 -   Updated install/deployment documentation - Daman
                                 Added support for Azure Blob stores
                                 Added parameters to skip the collection of various Azure services
 Updated by DamaniN: 1/31/24 -   Added support for Azure Backup Vaults, Policies, and Items
-Updated by IanS: 3/19/25    -   Added azure_sizing_summary .csv file to output 
+Updated by IanS: 3/19/25    -   Added azure_sizing_summary .csv file to output
+Updated by VivekS: 9/17/25  -   Added support for Azure Kubernetes Service (AKS) clusters
+                                  Added -SkipAKS parameter to skip AKS data collection
+                                  Added AKS cluster metadata, node pool information, and tag collection
+                                  Added AKS anonymization support and CSV export functionality
+                                  Removed empty -Operator parameter from cost management query
 
 If you run this script and get an error message similar to this:
 
@@ -190,6 +198,10 @@ Runs the script against Azure Management Groups "Group1" and "Group2".
 Runs the script against all subscriptions in the that the user has access to but skips the collection of Azure Storage Account data.
 
 .EXAMPLE
+./Get-AzureSizingInfo.ps1 -SkipAKS
+Runs the script against all subscriptions that the user has access to but skips the collection of Azure Kubernetes Service (AKS) cluster data.
+
+.EXAMPLE
 ./Get-AzureSizingInfo.ps1 -Subscriptions "sub1" -GetContainerDetails
 Runs the script against the subscription "sub1" and does a deeper inspection of Azure blob storage
 
@@ -209,6 +221,9 @@ param (
   [Parameter(Mandatory=$false)]
   [ValidateNotNullOrEmpty()]
   [switch]$GetKeyVaultAmounts,
+  [Parameter(Mandatory=$false)]
+  [ValidateNotNullOrEmpty()]
+  [switch]$SkipAKS,
   [Parameter(Mandatory=$false)]
   [ValidateNotNullOrEmpty()]
   [switch]$SkipAzureBackup,
@@ -292,7 +307,7 @@ $PSBoundParameters | Format-Table
 
 $archiveFile = "azure_sizing_results_$($date.ToString('yyyy-MM-dd_HHmm')).zip"
 
-Import-Module Az.Accounts, Az.Compute, Az.Storage, Az.Sql, Az.SqlVirtualMachine, Az.ResourceGraph, Az.Monitor, Az.Resources, Az.RecoveryServices, Az.CostManagement
+Import-Module Az.Accounts, Az.Aks, Az.Compute, Az.Storage, Az.Sql, Az.SqlVirtualMachine, Az.ResourceGraph, Az.Monitor, Az.Resources, Az.RecoveryServices, Az.CostManagement, Az.CosmosDB
 
 function GenerateVMKey {
   param (
@@ -310,16 +325,147 @@ function Get-AzureFileSAs {
       [PSObject]$StorageAccount
   )
 
-  return ($StorageAccount.Kind -in @('StorageV2', 'Storage') -and 
+  return ($StorageAccount.Kind -in @('StorageV2', 'Storage') -and
             $StorageAccount.Sku.Name -notin @('Premium_LRS', 'Premium_ZRS')) -or
-            ($StorageAccount.Kind -eq 'FileStorage' -and 
+            ($StorageAccount.Kind -eq 'FileStorage' -and
             $StorageAccount.Sku.Name -in @('Premium_LRS', 'Premium_ZRS'))
+}
+
+function getAKSInventory {
+  param (
+      [Parameter(Mandatory=$true)]
+      [PSObject]$sub,
+      [Parameter(Mandatory=$true)]
+      [PSObject]$tenant
+  )
+
+  Write-Host "Getting Azure Kubernetes Service (AKS) information for subscription: $($sub.Name)" -ForegroundColor Green
+
+  # Get a list of all AKS clusters in the subscription
+  try {
+    $aksClusters = Get-AzAksCluster -ErrorAction Stop
+  } catch {
+    Write-Error "Unable to collect AKS cluster information for subscription: $($sub.Name) under tenant $($tenant.Name)"
+    Write-Error "Error: $_"
+    return
+  }
+
+  # Check if any clusters were found
+  if ($null -eq $aksClusters -or $aksClusters.Count -eq 0) {
+    Write-Host "No AKS clusters found in subscription: $($sub.Name)" -ForegroundColor Yellow
+    return
+  }
+
+  Write-Host "Found $($aksClusters.Count) AKS cluster(s) in subscription: $($sub.Name)" -ForegroundColor Green
+
+  # Loop through each AKS cluster and gather information
+  $aksClusterNum = 1
+  foreach ($aksCluster in $aksClusters) {
+    Write-Progress -Id 11 -Activity "Getting AKS cluster information for: $($aksCluster.Name)" `
+                  -PercentComplete $(($aksClusterNum/$aksClusters.Count)*100) -ParentId 1 `
+                  -Status "AKS Cluster $($aksClusterNum) of $($aksClusters.Count)"
+    $aksClusterNum++
+
+    try {
+      # Get detailed cluster information
+      $clusterDetails = Get-AzAksCluster -ResourceGroupName $aksCluster.ResourceGroupName -Name $aksCluster.Name -ErrorAction Stop
+
+      # Create ordered hashtable for cluster data
+      $aksClusterObj = [ordered] @{}
+      $aksClusterObj.Add("Subscription", $sub.Name)
+      $aksClusterObj.Add("Tenant", $tenant.Name)
+      $aksClusterObj.Add("Name", $clusterDetails.Name)
+      $aksClusterObj.Add("ResourceGroup", $clusterDetails.ResourceGroupName)
+      $aksClusterObj.Add("Location", $clusterDetails.Location)
+      $aksClusterObj.Add("Id", $clusterDetails.Id)
+      $aksClusterObj.Add("KubernetesVersion", $clusterDetails.KubernetesVersion ?? "-")
+      $aksClusterObj.Add("ProvisioningState", $clusterDetails.ProvisioningState ?? "-")
+      $aksClusterObj.Add("PowerState", $clusterDetails.PowerState.Code ?? "-")
+      $aksClusterObj.Add("DnsPrefix", $clusterDetails.DnsPrefix ?? "-")
+      $aksClusterObj.Add("Fqdn", $clusterDetails.Fqdn ?? "-")
+      $aksClusterObj.Add("NodeResourceGroup", $clusterDetails.NodeResourceGroup ?? "-")
+
+      # Collect node pool information
+      try {
+        $nodePools = Get-AzAksNodePool -ResourceGroupName $clusterDetails.ResourceGroupName -ClusterName $clusterDetails.Name -ErrorAction Stop
+
+        # Calculate node pool statistics
+        $nodePoolCount = $nodePools.Count
+        $nodePoolNames = ($nodePools | ForEach-Object { $_.Name ?? "-" }) -join "; "
+        $nodePoolVMSizes = ($nodePools | ForEach-Object { $_.VmSize ?? "-" }) -join "; "
+        $nodePoolNodeCounts = ($nodePools | ForEach-Object { $_.Count ?? 0 }) -join "; "
+        $nodePoolMaxCounts = ($nodePools | ForEach-Object { $_.MaxCount ?? "-" }) -join "; "
+        $nodePoolOSDiskSizes = ($nodePools | ForEach-Object { $_.OsDiskSizeGB ?? "-" }) -join "; "
+        $totalNodes = ($nodePools | Measure-Object -Property Count -Sum).Sum
+
+        # Add node pool information to cluster object
+        $aksClusterObj.Add("NodePoolCount", $nodePoolCount ?? 0)
+        $aksClusterObj.Add("NodePoolNames", $nodePoolNames ?? "-")
+        $aksClusterObj.Add("NodePoolVMSizes", $nodePoolVMSizes ?? "-")
+        $aksClusterObj.Add("NodePoolNodeCounts", $nodePoolNodeCounts ?? "-")
+        $aksClusterObj.Add("NodePoolMaxCounts", $nodePoolMaxCounts ?? "-")
+        $aksClusterObj.Add("NodePoolOSDiskSizes", $nodePoolOSDiskSizes ?? "-")
+        $aksClusterObj.Add("TotalNodes", $totalNodes ?? 0)
+
+        # Loop through possible tags adding the property if there is one, adding it with a hyphen as it's value if it doesn't.
+        if ($clusterDetails.Tags.Count -ne 0) {
+          $uniqueAzTags | Foreach-Object {
+              if ($clusterDetails.Tags[$_]) {
+                  $aksClusterObj.Add("Tag: $_",$clusterDetails.Tags[$_])
+              }
+              else {
+                  $aksClusterObj.Add("Tag: $_","-")
+              }
+          }
+        } else {
+            $uniqueAzTags | Foreach-Object { $aksClusterObj.Add("Tag: $_","-") }
+        }
+
+      } catch {
+        Write-Error "Unable to collect node pool information for AKS cluster: $($clusterDetails.Name) in subscription: $($sub.Name) under tenant $($tenant.Name)"
+        Write-Error "Error: $_"
+
+        # Add default values for node pool information
+        $aksClusterObj.Add("NodePoolCount", 0)
+        $aksClusterObj.Add("NodePoolNames", "-")
+        $aksClusterObj.Add("NodePoolVMSizes", "-")
+        $aksClusterObj.Add("NodePoolNodeCounts", "-")
+        $aksClusterObj.Add("NodePoolMaxCounts", "-")
+        $aksClusterObj.Add("NodePoolOSDiskSizes", "-")
+        $aksClusterObj.Add("TotalNodes", 0)
+
+        # Loop through possible tags adding the property if there is one, adding it with a hyphen as it's value if it doesn't.
+        if ($clusterDetails.Tags.Count -ne 0) {
+          $uniqueAzTags | Foreach-Object {
+              if ($clusterDetails.Tags[$_]) {
+                  $aksClusterObj.Add("Tag: $_",$clusterDetails.Tags[$_])
+              }
+              else {
+                  $aksClusterObj.Add("Tag: $_","-")
+              }
+          }
+        } else {
+            $uniqueAzTags | Foreach-Object { $aksClusterObj.Add("Tag: $_","-") }
+        }
+      }
+
+      # Add cluster to the collection
+      $script:aksList += New-Object -TypeName PSObject -Property $aksClusterObj
+
+    } catch {
+      Write-Error "Unable to collect detailed information for AKS cluster: $($aksCluster.Name) in subscription: $($sub.Name) under tenant $($tenant.Name)"
+      Write-Error "Error: $_"
+      Continue
+    }
+  }
+  Write-Progress -Id 11 -Activity "Getting AKS cluster information" -Completed
 }
 
 try{
 
 # Filenames of the CSVs to output
 $fileDate = $date.ToString("yyyy-MM-dd_HHmm")
+$outputAKS = "azure_aks_info-$($fileDate).csv"
 $outputVmDisk = "azure_vmdisk_info-$($fileDate).csv"
 $outputSQL = "azure_sql_info-$($fileDate).csv"
 $outputMI = "azure_mi_sql_info-$($fileDate).csv"
@@ -350,6 +496,7 @@ $context = Get-AzContext
 $context | Select-Object -Property Account,Environment,Tenant |  format-table
 
 # Arrays for collecting data.
+$aksList = @()
 $azTags = @()
 $vmList = @{}
 $sqlList = @()
@@ -461,11 +608,21 @@ foreach ($sub in $subs) {
     Continue
   }
 
-  $azTags += $(Get-AzTag).Name
+  try {
+    $tags = $(Get-AzTag -ErrorAction Stop).Name
+    if ($tags) {
+      $azTags += $tags
+    }
+  } catch {
+    Write-Warning "Unable to collect tag information from subscription: $($sub.Name). Error: $_"
+  }
 } # foreach ($sub in $subs)
 Write-Progress -Id 1 -Activity "Getting tag information from subscription: $($sub.Name)" -Completed
 
-$uniqueAzTags = $azTags | Sort-Object -Unique
+$uniqueAzTags = $azTags | Where-Object { $_ -ne $null -and $_ -ne "" } | Sort-Object -Unique
+if (-not $uniqueAzTags) {
+  $uniqueAzTags = @()  # Ensure it's an empty array, not null
+}
 
 # Get Azure information for all specified subscriptions
 $subNum=1
@@ -661,7 +818,7 @@ foreach ($sub in $subs) {
                 if ($pool.Tags.Count -ne 0) {
                   $uniqueAzTags | Foreach-Object {
                       if ($pool.Tags[$_]) {
-                          $sqlObj.Add("Tag: $_)",$pool.Tags[$_])
+                          $sqlObj.Add("Tag: $_",$pool.Tags[$_])
                       }
                       else {
                           $sqlObj.Add("Tag: $_","-")
@@ -883,7 +1040,7 @@ foreach ($sub in $subs) {
       # Loop through possible tags adding the property if there is one, adding it with a hyphen as it's value if it doesn't.
       if ($MI.Tags.Count -ne 0) {
         $uniqueAzTags | Foreach-Object {
-            if ($MI.Tags[$_]) {
+            if ($_ -and $MI.Tags.ContainsKey($_)) {
                 $sqlObj.Add("Tag: $_",$MI.Tags[$_])
             }
             else {
@@ -891,7 +1048,9 @@ foreach ($sub in $subs) {
             }
         }
       } else {
-          $uniqueAzTags | Foreach-Object { $sqlObj.Add("Tag: $_","-") }
+          $uniqueAzTags | Foreach-Object {
+              if ($_) { $sqlObj.Add("Tag: $_","-") }
+          }
       }
       $miList += New-Object -TypeName PSObject -Property $sqlObj
     } # foreach ($MI in $sqlManagedInstances)
@@ -989,6 +1148,10 @@ foreach ($sub in $subs) {
     }
     Write-Progress -Id 6 -Activity "Getting Azure CosmosDB information for: $($rg.ResourceGroupName)" -Completed
   } # if($SkipAzureCosmosDB -ne $true)
+
+  if ($SkipAKS -ne $true) {
+    getAKSInventory -sub $sub -tenant $tenant
+  } # if ($SkipAKS -ne $true)
 
   if ($SkipAzureStorageAccounts -ne $true) {
     # Get a list of all Azure Storage Accounts.
@@ -1389,7 +1552,7 @@ foreach ($sub in $subs) {
     $TimePeriodFrom = [datetime]::Parse($startDate)
     $TimePeriodTo = [datetime]::Parse($endDate)
     try{
-      $dimensions = New-AzCostManagementQueryComparisonExpressionObject -Name 'ServiceName' -Value 'Backup' -Operator ""
+      $dimensions = New-AzCostManagementQueryComparisonExpressionObject -Name 'ServiceName' -Value 'Backup'
       $filter = New-AzCostManagementQueryFilterObject -Dimensions $dimensions
     
       $aggregation = @{                                                                                                                                                             
@@ -1492,12 +1655,12 @@ Write-Progress -Id 1 -Activity "Getting information from subscription: $($sub.Na
 Write-Host "Calculating results and saving data..." -ForegroundColor Green
 
 if ($Anonymize) {
-  $global:anonymizeProperties = @("SubscriptionId", "Subscription", "Tenant", "Name", "AzureBackupRGName", 
+  $global:anonymizeProperties = @("SubscriptionId", "Subscription", "Tenant", "Name", "AzureBackupRGName",
                                   "ResourceGroupName", "DatabaseName", "ManagedInstanceName", "InstanceName",
                                   "ResourceGroup", "VirtualMachineId", "PolicyId", "ProtectionPolicyName", "Id",
                                   "SourceResourceId", "ContainerName", "FriendlyName", "ServerName", "ParentName",
                                   "ProtectedItemDataSourceId",  "StorageAccount", "Database", "Server", "ElasticPool",
-                                  "ManagedInstance", "DatabaseID", "vmID"
+                                  "ManagedInstance", "DatabaseID", "vmID", "NodeResourceGroup", "DnsPrefix", "Fqdn"
                                   )
 
   if($AnonymizeFields){
@@ -1854,6 +2017,23 @@ if ($SkipAzureCosmosDB -ne $true) {
 
 } #if ($SkipAzureCosmosDB -ne $true)
 
+if ($SkipAKS -ne $true) {
+  $aksTotalNodes = ($aksList.TotalNodes | Measure-Object -Sum).Sum
+
+  Write-Host "Total # of Azure Kubernetes Service (AKS) clusters: $('{0:N0}' -f $aksList.count)" -ForeGroundColor Green
+  Write-Host "Total # of nodes across all AKS clusters: $('{0:N0}' -f $aksTotalNodes)" -ForeGroundColor Green
+
+  $aksListToCsv = $aksList
+
+  if ($Anonymize) {
+    $aksListToCsv = AnonymizeCollection -Collection $aksList
+  }
+
+  $outputFiles += New-Object -TypeName pscustomobject -Property @{Files="$outputAKS - Azure Kubernetes Service (AKS) CSV file."}
+  $aksListToCsv | Export-CSV -path $outputAKS -NoTypeInformation
+
+} #if ($SkipAKS -ne $true)
+
 if($GetKeyVaultAmounts -eq $true){
   Write-Host "Total # of Azure Key Vaults: $('{0:N0}' -f $keyVaultList.values.count)" -ForeGroundColor Green
 
@@ -1927,6 +2107,7 @@ Write-Host "Storage Account List available: $(if ($azSAList) { 'Yes' } else { 'N
 Write-Host "File Share List available: $(if ($azFSList) { 'Yes' } else { 'No' }), Count: $(if ($azFSList) { $azFSList.Count } else { 0 })" -ForegroundColor Yellow
 Write-Host "SQL List available: $(if ($sqlList) { 'Yes' } else { 'No' }), Count: $(if ($sqlList) { $sqlList.Count } else { 0 })" -ForegroundColor Yellow
 Write-Host "MI List available: $(if ($miList) { 'Yes' } else { 'No' }), Count: $(if ($miList) { $miList.Count } else { 0 })" -ForegroundColor Yellow
+Write-Host "AKS List available: $(if ($aksList) { 'Yes' } else { 'No' }), Count: $(if ($aksList) { $aksList.Count } else { 0 })" -ForegroundColor Yellow
 #>
 
 # VM and Managed Disks Summary
@@ -2127,6 +2308,45 @@ if ($miList -and $miList.Count -gt 0) {
             Count = $_.Count
         }
         $summaryData += $miSqlRegionSummary
+    }
+    Add-SeparatorRow
+}
+
+# AKS Clusters Summary
+if ($aksList -and $aksList.Count -gt 0) {
+    # Section header
+    $summaryData += [PSCustomObject]@{
+        ResourceType = "[ Azure Kubernetes Service (AKS) Clusters ]"
+        Region = ""
+        TotalSizeTiB = $null
+        TotalSizeTB = $null
+        Count = $null
+    }
+
+    # Calculate total nodes across all clusters
+    $totalNodes = ($aksList | Measure-Object -Property TotalNodes -Sum).Sum
+
+    # Overall summary
+    $aksSummary = [PSCustomObject]@{
+        ResourceType = ""
+        Region = "All Regions (Total Nodes: $totalNodes)"
+        TotalSizeTiB = $null  # AKS doesn't have storage size metrics like other services
+        TotalSizeTB = $null   # AKS doesn't have storage size metrics like other services
+        Count = $aksList.Count
+    }
+    $summaryData += $aksSummary
+
+    # Per-region summary
+    $aksList | Group-Object Location | Sort-Object Name | ForEach-Object {
+        $regionNodes = ($_.Group | Measure-Object -Property TotalNodes -Sum).Sum
+        $aksRegionSummary = [PSCustomObject]@{
+            ResourceType = ""
+            Region = "$($_.Name) (Nodes: $regionNodes)"
+            TotalSizeTiB = $null
+            TotalSizeTB = $null
+            Count = $_.Count
+        }
+        $summaryData += $aksRegionSummary
     }
     Add-SeparatorRow
 }
